@@ -3,6 +3,11 @@ Interactive Transformer Architecture Visualizer
 
 A Streamlit dashboard for exploring nanoGPT and nanochat model architectures.
 Displays model components, parameter counts, and architecture diagrams.
+
+Sources:
+- FLOPs calculation: https://www.adamcasson.com/posts/transformer-flops
+- PaLM paper (Appendix B): https://arxiv.org/abs/2204.02311
+- nanoGPT: https://github.com/karpathy/nanoGPT
 """
 
 import sys
@@ -202,61 +207,102 @@ def render_svg_with_tooltips(dot: graphviz.Digraph, height: int = 800) -> None:
 # =============================================================================
 
 # nanoGPT code snippets (from nanoGPT/model.py)
+# Notation: d=n_embd, h=n_head, d_h=d/h (head_dim), V=vocab_size, T=block_size, L=n_layer
 NANOGPT_CODE = {
     "wte": """# Token Embedding (model.py:127)
 nn.Embedding(config.vocab_size, config.n_embd)
 
+# Weight shape: (V, d) - vocab_size × n_embd
 # Weight-tied with lm_head (model.py:138)
 self.transformer.wte.weight = self.lm_head.weight""",
 
     "wpe": """# Position Embedding (model.py:128)
-nn.Embedding(config.block_size, config.n_embd)""",
+nn.Embedding(config.block_size, config.n_embd)
+
+# Weight shape: (T, d) - block_size × n_embd
+# Each position gets a learned d-dimensional vector""",
 
     "ln": """# LayerNorm with optional bias (model.py:18-27)
 class LayerNorm(nn.Module):
     def __init__(self, ndim, bias):
         self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None""",
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+
+# Weight shape: (d,) - n_embd
+# Bias shape: (d,) if bias=True, else None
+# Normalizes over the last dimension (embedding dim)""",
 
     "c_attn": """# Combined QKV projection (model.py:35)
 self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
 
+# Weight shape: (d, 3d) - n_embd × 3*n_embd
+# Bias shape: (3d,) if bias=True
+# Projects input to concatenated [Q, K, V]
 # Split into Q, K, V (model.py:56)
-q, k, v = self.c_attn(x).split(self.n_embd, dim=2)""",
+q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+# Each of Q, K, V has shape (B, T, d) then reshaped to (B, h, T, d_h)""",
 
     "attn_op": """# Scaled dot-product attention (model.py:62-71)
+# Input Q, K, V shapes: (B, h, T, d_h)
+# Attention scores: Q @ K^T = (B, h, T, d_h) @ (B, h, d_h, T) = (B, h, T, T)
+# Scale by 1/sqrt(d_h) for stable gradients
 if self.flash:
     y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 else:
     att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
     att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
     att = F.softmax(att, dim=-1)
-    y = att @ v""",
+    y = att @ v  # (B, h, T, T) @ (B, h, T, d_h) = (B, h, T, d_h)
+# Output shape: (B, h, T, d_h) -> reshaped to (B, T, d)""",
 
     "attn_proj": """# Output projection (model.py:37)
 self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
-# Applied after attention (model.py:75)
-y = self.resid_dropout(self.c_proj(y))""",
+# Weight shape: (d, d) - n_embd × n_embd
+# Bias shape: (d,) if bias=True
+# Projects concatenated heads back to residual stream
+# Input: (B, T, d), Output: (B, T, d)""",
 
     "mlp_fc": """# Up projection / first FC layer (model.py:82)
-self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)""",
+self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+
+# Weight shape: (d, 4d) - n_embd × 4*n_embd
+# Bias shape: (4d,) if bias=True
+# Expands from d to 4d (standard GPT-2 ratio)
+# Input: (B, T, d), Output: (B, T, 4d)""",
 
     "gelu": """# GELU activation (model.py:83, 88-89)
 self.gelu = nn.GELU()
-x = self.gelu(x)""",
+x = self.gelu(x)
+
+# No learnable parameters
+# Applied element-wise: (B, T, 4d) -> (B, T, 4d)
+# GELU(x) ≈ x * sigmoid(1.702 * x)""",
 
     "mlp_proj": """# Down projection / second FC layer (model.py:84)
-self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)""",
+self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+
+# Weight shape: (4d, d) - 4*n_embd × n_embd
+# Bias shape: (d,) if bias=True
+# Compresses from 4d back to d
+# Input: (B, T, 4d), Output: (B, T, d)""",
 
     "ln_f": """# Final LayerNorm (model.py:131)
-ln_f = LayerNorm(config.n_embd, bias=config.bias)""",
+ln_f = LayerNorm(config.n_embd, bias=config.bias)
+
+# Weight shape: (d,) - n_embd
+# Bias shape: (d,) if bias=True
+# Pre-norm architecture requires this final norm
+# Input: (B, T, d), Output: (B, T, d)""",
 
     "lm_head": """# Language model head (model.py:133)
 self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+# Weight shape: (d, V) - n_embd × vocab_size
+# No bias (bias=False)
 # Weight-tied with token embedding (model.py:138)
-self.transformer.wte.weight = self.lm_head.weight""",
+self.transformer.wte.weight = self.lm_head.weight
+# Input: (B, T, d), Output: (B, T, V)""",
 
     "block": """# Transformer Block (model.py:94-106)
 class Block(nn.Module):
@@ -267,39 +313,63 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x""",
+        x = x + self.attn(self.ln_1(x))  # pre-norm attention
+        x = x + self.mlp(self.ln_2(x))   # pre-norm MLP
+        return x
+
+# Input/Output shape: (B, T, d) - preserved through residuals""",
 }
 
 # nanochat code snippets (from nanochat/gpt.py)
+# Notation: d=n_embd, h=n_head, k=n_kv_head, d_h=d/h (head_dim), V=vocab_size, V'=padded_vocab, T=seq_len, L=n_layer
 NANOCHAT_CODE = {
     "wte": """# Token Embedding with vocab padding (gpt.py:155, 159)
 padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
-nn.Embedding(padded_vocab_size, config.n_embd)""",
+nn.Embedding(padded_vocab_size, config.n_embd)
+
+# Weight shape: (V', d) - padded_vocab_size × n_embd
+# Padding to multiple of 64 for tensor core efficiency""",
 
     "norm": """# RMSNorm - purely functional, no learnable params (gpt.py:48-50)
 def norm(x):
-    return F.rms_norm(x, (x.size(-1),))""",
+    return F.rms_norm(x, (x.size(-1),))
+
+# No learnable parameters! (unlike LayerNorm)
+# Normalizes by RMS: x / sqrt(mean(x²) + eps)
+# Input/Output shape unchanged: (B, T, d) -> (B, T, d)""",
 
     "scale_in": """# Per-layer residual scaling (gpt.py:167-168, 359-360)
 self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
 self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
 
+# Shape: (L,) - one scalar per layer for each
 # Applied before each block (gpt.py:359-360)
 x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-x = block(x, cos_sin, self.window_sizes[i], kv_cache)""",
+# Blends residual stream with initial embedding x0""",
 
     "c_q": """# Query projection (gpt.py:71)
-self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)""",
+self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+
+# Weight shape: (d, h×d_h) = (d, d) - n_embd × n_embd
+# No bias (all nanochat linears are bias=False)
+# Input: (B, T, d), Output: (B, T, d) -> reshaped to (B, T, h, d_h)""",
 
     "c_k": """# Key projection - fewer heads for GQA (gpt.py:72)
-self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)""",
+self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+
+# Weight shape: (d, k×d_h) - n_embd × (n_kv_head × head_dim)
+# With GQA: k < h, so this is smaller than Q projection
+# Example: h=12, k=4, d_h=64 -> (768, 256) instead of (768, 768)
+# Input: (B, T, d), Output: (B, T, k×d_h) -> reshaped to (B, T, k, d_h)""",
 
     "c_v": """# Value projection - fewer heads for GQA (gpt.py:73)
-self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)""",
+self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
 
-    "rotary": """# Rotary embeddings (gpt.py:53-59, 86-88)
+# Weight shape: (d, k×d_h) - n_embd × (n_kv_head × head_dim)
+# Same size as K projection (GQA shares KV head count)
+# Input: (B, T, d), Output: (B, T, k×d_h) -> reshaped to (B, T, k, d_h)""",
+
+    "rotary": """# Rotary Position Embeddings (gpt.py:53-59, 86-88)
 def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
@@ -307,33 +377,67 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
+# cos, sin are precomputed: shape (1, T, 1, d_h/2)
+# Applied to Q and K: rotates pairs of dimensions
+# No learnable parameters - position encoded via rotation angles
+
 # QK normalization (gpt.py:88)
-q, k = norm(q), norm(k)""",
+q, k = norm(q), norm(k)  # RMSNorm before attention""",
 
     "flash_attn": """# Flash Attention 3 (gpt.py:93-95)
-# FA3 handles GQA automatically when n_kv_heads < n_heads
-y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)""",
+y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+
+# FA3 handles GQA automatically: broadcasts k KV heads to h Q heads
+# Input Q: (B, T, h, d_h), K: (B, T, k, d_h), V: (B, T, k, d_h)
+# Output: (B, T, h, d_h) - same shape as Q
+# window_size enables sliding window attention (memory efficient)
+# No learnable parameters - just efficient attention computation""",
 
     "attn_proj": """# Output projection (gpt.py:74)
-self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)""",
+self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+# Weight shape: (d, d) - n_embd × n_embd
+# Projects concatenated attention heads back to residual stream
+# Input: (B, T, d), Output: (B, T, d)""",
 
     "mlp_fc": """# Up projection (gpt.py:119)
-self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)""",
+self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+
+# Weight shape: (d, 4d) - n_embd × 4*n_embd
+# Expands from d to 4d (standard transformer ratio)
+# Input: (B, T, d), Output: (B, T, 4d)""",
 
     "relu_sq": """# Squared ReLU activation (gpt.py:124)
-x = F.relu(x).square()""",
+x = F.relu(x).square()
+
+# No learnable parameters
+# Applied element-wise: (B, T, 4d) -> (B, T, 4d)
+# ReLU²(x) = max(0, x)² - sparser than GELU, helps with training""",
 
     "mlp_proj": """# Down projection (gpt.py:120)
-self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)""",
+self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+# Weight shape: (4d, d) - 4*n_embd × n_embd
+# Compresses from 4d back to d
+# Input: (B, T, 4d), Output: (B, T, d)""",
 
     "lm_head": """# Language model head - NOT weight-tied (gpt.py:162)
-self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)""",
+self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+
+# Weight shape: (d, V') - n_embd × padded_vocab_size
+# Unlike nanoGPT, this is SEPARATE from embedding (not tied)
+# This adds V'×d extra parameters but allows different representations
+# Input: (B, T, d), Output: (B, T, V')""",
 
     "softcap": """# Logit soft-capping (gpt.py:364-368)
 softcap = 15
 logits = self.lm_head(x)
-logits = logits[..., :self.config.vocab_size]  # remove padding
-logits = softcap * torch.tanh(logits / softcap)  # smooth extreme values""",
+logits = logits[..., :self.config.vocab_size]  # remove padding: (B,T,V') -> (B,T,V)
+logits = logits.float()  # fp32 for numerical stability
+logits = softcap * torch.tanh(logits / softcap)  # squash to [-15, 15]
+
+# Prevents extreme logits that can cause training instability
+# tanh smoothly caps values: large |x| -> ±softcap""",
 
     "block": """# Transformer Block (gpt.py:129-138)
 class Block(nn.Module):
@@ -342,9 +446,12 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x""",
+        x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)  # pre-norm
+        x = x + self.mlp(norm(x))  # pre-norm
+        return x
+
+# Input/Output shape: (B, T, d) - preserved through residuals
+# Note: No LayerNorm modules - uses functional RMSNorm (no params)""",
 }
 
 
@@ -491,6 +598,259 @@ def calc_nanochat_params(n_layer: int, n_head: int, n_kv_head: int, n_embd: int,
         "padded_vocab_size": padded_vocab_size,
         "n_kv_head": n_kv_head,
     }
+
+
+# =============================================================================
+# Memory and Compute Estimation Functions
+# =============================================================================
+
+DTYPE_BYTES = {
+    "fp32": 4,
+    "fp16": 2,
+    "bf16": 2,
+    "int8": 1,
+}
+
+
+def format_bytes(n_bytes: int) -> str:
+    """Format byte count with appropriate suffix (binary units, 1024-based)."""
+    KiB = 1024
+    MiB = 1024 ** 2
+    GiB = 1024 ** 3
+    TiB = 1024 ** 4
+
+    if n_bytes >= TiB:
+        return f"{n_bytes/TiB:.2f} TB"
+    elif n_bytes >= GiB:
+        return f"{n_bytes/GiB:.2f} GB"
+    elif n_bytes >= MiB:
+        return f"{n_bytes/MiB:.2f} MB"
+    elif n_bytes >= KiB:
+        return f"{n_bytes/KiB:.1f} KB"
+    return f"{n_bytes} B"
+
+
+def format_flops(flops: int) -> str:
+    """Format FLOP count with appropriate suffix."""
+    if flops >= 1e15:
+        return f"{flops/1e15:.2f} PFLOPs"
+    elif flops >= 1e12:
+        return f"{flops/1e12:.2f} TFLOPs"
+    elif flops >= 1e9:
+        return f"{flops/1e9:.2f} GFLOPs"
+    elif flops >= 1e6:
+        return f"{flops/1e6:.2f} MFLOPs"
+    elif flops >= 1e3:
+        return f"{flops/1e3:.1f} KFLOPs"
+    return f"{flops} FLOPs"
+
+
+def calc_memory_params(total_params: int, dtype: str = "bf16") -> int:
+    """Calculate memory required for model parameters."""
+    return total_params * DTYPE_BYTES[dtype]
+
+
+def calc_memory_kv_cache(
+    n_layer: int,
+    n_kv_head: int,
+    head_dim: int,
+    batch_size: int,
+    seq_len: int,
+    dtype: str = "bf16"
+) -> int:
+    """
+    Calculate KV cache memory for inference.
+
+    KV cache stores K and V tensors for all layers to avoid recomputation
+    during autoregressive generation.
+
+    Per layer: 2 (K and V) × batch × seq_len × n_kv_head × head_dim × bytes
+    """
+    bytes_per_elem = DTYPE_BYTES[dtype]
+    per_layer = 2 * batch_size * seq_len * n_kv_head * head_dim * bytes_per_elem
+    return n_layer * per_layer
+
+
+def calc_memory_activations(
+    n_layer: int,
+    n_head: int,
+    n_embd: int,
+    batch_size: int,
+    seq_len: int,
+    dtype: str = "bf16",
+    flash_attention: bool = True
+) -> int:
+    """
+    Estimate activation memory for training (forward pass).
+
+    Main activations per layer:
+    - Input to attention/MLP: (B, T, d)
+    - Q, K, V: 3 × (B, T, d)
+    - Attention output: (B, T, d)
+    - MLP intermediate: (B, T, 4d)
+    - Attention scores: (B, h, T, T) - only if not using Flash Attention!
+
+    This is a rough estimate - actual memory depends on framework, checkpointing, etc.
+    """
+    bytes_per_elem = DTYPE_BYTES[dtype]
+
+    # Per-layer activation memory (rough estimate)
+    # Residual stream saved for backward: (B, T, d)
+    residual = batch_size * seq_len * n_embd * bytes_per_elem
+
+    # QKV activations: 3 × (B, T, d)
+    qkv = 3 * batch_size * seq_len * n_embd * bytes_per_elem
+
+    # Attention output before projection: (B, T, d)
+    attn_out = batch_size * seq_len * n_embd * bytes_per_elem
+
+    # MLP intermediate (after up-projection): (B, T, 4d)
+    mlp_intermediate = batch_size * seq_len * (4 * n_embd) * bytes_per_elem
+
+    # Attention scores: (B, h, T, T) - this is the big one!
+    # Flash Attention avoids materializing this
+    if flash_attention:
+        attn_scores = 0
+    else:
+        attn_scores = batch_size * n_head * seq_len * seq_len * bytes_per_elem
+
+    per_layer = residual + qkv + attn_out + mlp_intermediate + attn_scores
+
+    # Add ~20% overhead for gradients, optimizer states held during backward, etc.
+    per_layer = int(per_layer * 1.2)
+
+    return n_layer * per_layer
+
+
+def calc_flops_per_token(
+    n_layer: int,
+    n_head: int,
+    n_kv_head: int,
+    n_embd: int,
+    vocab_size: int,
+    seq_len: int,
+    forward_only: bool = True
+) -> int:
+    """
+    Estimate FLOPs per token.
+
+    Based on "Transformer FLOPs" by Adam Casson and the PaLM paper:
+    https://www.adamcasson.com/posts/transformer-flops
+
+    Key formulas:
+    - Each matmul with weight (in, out) costs 2 × in × out FLOPs (multiply + accumulate)
+    - Forward pass: ~2N FLOPs per token (N = non-embedding params in matmuls)
+    - Backward pass: ~4N FLOPs per token (grad_input + grad_weight)
+    - Total training: ~6N FLOPs per token
+
+    Attention context-dependent term (per layer per token):
+    - Q @ K^T: 2 × T × d_attn FLOPs
+    - attn @ V: 2 × T × d_attn FLOPs
+    - Total: 4 × T × d_attn (often negligible when d > T/12)
+    """
+    head_dim = n_embd // n_head
+
+    # Count matmul parameters per layer (excluding embeddings)
+    # Attention: Q, K, V projections + output projection
+    # With GQA, K and V projections are smaller (n_kv_head instead of n_head)
+    attn_q = n_embd * n_embd  # Q projection: (d, d)
+    attn_k = n_embd * (n_kv_head * head_dim)  # K projection: (d, k×d_h)
+    attn_v = n_embd * (n_kv_head * head_dim)  # V projection: (d, k×d_h)
+    attn_proj = n_embd * n_embd  # Output projection: (d, d)
+
+    # MLP: up and down projections
+    mlp_up = n_embd * (4 * n_embd)  # (d, 4d)
+    mlp_down = (4 * n_embd) * n_embd  # (4d, d)
+
+    params_per_layer = attn_q + attn_k + attn_v + attn_proj + mlp_up + mlp_down
+    total_matmul_params = n_layer * params_per_layer
+
+    # LM head (unembedding): (d, V)
+    lm_head_params = n_embd * vocab_size
+    total_matmul_params += lm_head_params
+
+    # Base FLOPs: 2 × params for forward (multiply + accumulate)
+    # Training: 6 × params (2 forward + 4 backward)
+    multiplier = 2 if forward_only else 6
+    base_flops = multiplier * total_matmul_params
+
+    # Attention context-dependent FLOPs per layer (not included in 2N approximation):
+    # Q @ K^T: 2 × T × d_attn per token (d_attn = n_head × head_dim = n_embd)
+    # attn @ V: 2 × T × d_attn per token
+    # Total: 4 × T × d_attn per token per layer
+    # Note: GQA doesn't reduce this - K,V are broadcast to all query heads
+    attn_context_flops_per_layer = 4 * seq_len * n_embd
+    total_attn_context_flops = n_layer * attn_context_flops_per_layer
+    if not forward_only:
+        total_attn_context_flops *= 3  # backward adds ~2× more
+
+    return base_flops + total_attn_context_flops
+
+
+def calc_generation_flops(
+    n_layer: int,
+    n_head: int,
+    n_kv_head: int,
+    n_embd: int,
+    vocab_size: int,
+    prompt_len: int,
+    gen_tokens: int,
+    use_kv_cache: bool = True
+) -> int:
+    """
+    Calculate total FLOPs to generate tokens autoregressively.
+
+    Without KV cache: Must recompute K, V for ALL previous tokens at each step.
+    With KV cache: Only compute K, V for the new token, retrieve cached values.
+
+    The key insight:
+    - Without KV cache: generating token t requires a forward pass over all t tokens
+      Total = sum(t for t in 1..N) = N(N+1)/2 token-passes
+    - With KV cache: generating token t requires forward pass for 1 new token
+      Total = N token-passes (but attention still looks at full context)
+    """
+    head_dim = n_embd // n_head
+
+    # FLOPs for projections (QKV + output + MLP + LM head) per token
+    # These scale with number of tokens processed
+    qkv_proj = n_embd * (n_embd + 2 * n_kv_head * head_dim)  # Q + K + V projections
+    attn_proj = n_embd * n_embd
+    mlp = 2 * n_embd * (4 * n_embd)  # up + down
+    lm_head = n_embd * vocab_size
+    proj_flops_per_token = 2 * n_layer * (qkv_proj + attn_proj + mlp) + 2 * lm_head
+
+    # Attention FLOPs per layer: scales with context length
+    # Q @ K^T + attn @ V = 4 * d * context_len per token
+    def attn_flops_for_context(context_len: int) -> int:
+        return 4 * n_embd * context_len * n_layer
+
+    total_flops = 0
+
+    if use_kv_cache:
+        # With KV cache:
+        # - Prompt: process all prompt tokens at once (like training)
+        # - Generation: each new token only computes its own projections
+        #   but attention still looks at full context
+
+        # Prompt processing (prefill)
+        total_flops += prompt_len * proj_flops_per_token
+        total_flops += prompt_len * attn_flops_for_context(prompt_len // 2)  # avg context
+
+        # Generation: 1 new token at a time
+        for i in range(gen_tokens):
+            context_len = prompt_len + i + 1
+            total_flops += proj_flops_per_token  # only 1 token's projections
+            total_flops += attn_flops_for_context(context_len)  # attention over full context
+    else:
+        # Without KV cache:
+        # Must recompute everything from scratch at each step
+        for i in range(gen_tokens):
+            context_len = prompt_len + i + 1
+            # Process ALL tokens (prompt + generated so far)
+            total_flops += context_len * proj_flops_per_token
+            total_flops += context_len * attn_flops_for_context(context_len // 2)
+
+    return total_flops
 
 
 # =============================================================================
@@ -767,6 +1127,9 @@ def main():
             help="nanoGPT: Classic GPT-2 style. nanochat: Modern with GQA, RoPE, etc."
         )
 
+        # GitHub links
+        st.caption("[nanoGPT](https://github.com/karpathy/nanoGPT) · [nanochat](https://github.com/znation/nanochat)")
+
         st.divider()
 
         # Preset configurations
@@ -774,7 +1137,7 @@ def main():
         if model_type == "nanoGPT":
             preset = st.selectbox(
                 "Load preset",
-                ["Custom", "nanogpt-tiny", "gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"],
+                ["nanogpt-tiny", "gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"],
             )
             presets = {
                 "nanogpt-tiny": {"n_layer": 3, "n_head": 3, "n_embd": 48, "block_size": 11, "vocab_size": 3},
@@ -786,22 +1149,15 @@ def main():
         else:
             preset = st.selectbox(
                 "Load preset",
-                ["Custom", "nanochat-small", "nanochat-medium", "nanochat-large"],
+                ["nanochat-small", "nanochat-medium", "nanochat-large"],
             )
             presets = {
                 "nanochat-small": {"n_layer": 12, "n_head": 6, "n_kv_head": 6, "n_embd": 768, "sequence_len": 1024, "vocab_size": 50304},
-                "nanochat-medium": {"n_layer": 24, "n_head": 12, "n_kv_head": 4, "n_embd": 1024, "sequence_len": 2048, "vocab_size": 50304},
+                "nanochat-medium": {"n_layer": 24, "n_head": 16, "n_kv_head": 4, "n_embd": 1024, "sequence_len": 2048, "vocab_size": 50304},
                 "nanochat-large": {"n_layer": 36, "n_head": 16, "n_kv_head": 4, "n_embd": 1536, "sequence_len": 4096, "vocab_size": 50304},
             }
 
-        # Get defaults from preset or use sensible defaults
-        if preset != "Custom" and preset in presets:
-            defaults = presets[preset]
-        else:
-            if model_type == "nanoGPT":
-                defaults = {"n_layer": 12, "n_head": 12, "n_embd": 768, "block_size": 1024, "vocab_size": 50304}
-            else:
-                defaults = {"n_layer": 12, "n_head": 6, "n_kv_head": 6, "n_embd": 768, "sequence_len": 1024, "vocab_size": 50304}
+        defaults = presets[preset]
 
         st.divider()
         st.subheader("Parameters")
@@ -869,6 +1225,37 @@ def main():
         if n_embd % n_head != 0:
             st.error(f"n_embd ({n_embd}) must be divisible by n_head ({n_head})")
             st.stop()
+
+        # Shape notation legend with actual values
+        st.divider()
+        st.subheader("Shape Notation")
+
+        # Compute derived values
+        head_dim = n_embd // n_head
+        seq_len = config.get("block_size", config.get("sequence_len", 1024))
+        kv_heads = config.get("n_kv_head", n_head)
+
+        st.markdown(f"""
+| Symbol | Meaning | Value |
+|--------|---------|-------|
+| `d` | n_embd | **{n_embd}** |
+| `h` | n_head | **{n_head}** |
+| `k` | n_kv_head | **{kv_heads}** |
+| `d_h` | head dim (d/h) | **{head_dim}** |
+| `V` | vocab_size | **{vocab_size:,}** |
+| `T` | seq length | **{seq_len:,}** |
+| `L` | n_layer | **{n_layer}** |
+| `B` | batch size | *(see below)* |
+""")
+        st.caption("Hover over diagram nodes for detailed shape info")
+
+        # Memory/compute estimation settings
+        st.divider()
+        st.subheader("Estimation Settings")
+        est_batch_size = st.number_input("Batch size (B)", 1, 256, 1, help="Batch size for memory estimates")
+        est_seq_len = st.number_input("Sequence length (T)", 1, 32768, seq_len, help="Sequence length for KV cache and activation estimates")
+        est_dtype = st.selectbox("Dtype", ["bf16", "fp16", "fp32", "int8"], help="Data type for memory calculations")
+        est_gen_tokens = st.number_input("Tokens to generate", 1, 8192, 100, help="Number of tokens to generate (for KV cache savings calculation)")
 
     # Calculate parameters
     if model_type == "nanoGPT":
@@ -961,6 +1348,115 @@ def main():
             kv_cache_reduction = (n_head - n_kv_head) / n_head * 100
             if kv_cache_reduction > 0:
                 st.markdown(f"**KV cache reduction:** {kv_cache_reduction:.0f}%")
+
+        st.divider()
+
+        # Memory and Compute Estimates
+        st.subheader("Memory & Compute")
+
+        # Get n_kv_head (same as n_head for nanoGPT)
+        n_kv_head_for_calc = config.get("n_kv_head", n_head)
+
+        # Calculate estimates
+        param_memory = calc_memory_params(params["total"], est_dtype)
+        kv_cache_memory = calc_memory_kv_cache(
+            n_layer=n_layer,
+            n_kv_head=n_kv_head_for_calc,
+            head_dim=params["head_dim"],
+            batch_size=est_batch_size,
+            seq_len=est_seq_len,
+            dtype=est_dtype
+        )
+        activation_memory = calc_memory_activations(
+            n_layer=n_layer,
+            n_head=n_head,
+            n_embd=n_embd,
+            batch_size=est_batch_size,
+            seq_len=est_seq_len,
+            dtype=est_dtype,
+            flash_attention=True
+        )
+        flops_fwd = calc_flops_per_token(
+            n_layer=n_layer,
+            n_head=n_head,
+            n_kv_head=n_kv_head_for_calc,
+            n_embd=n_embd,
+            vocab_size=vocab_size,
+            seq_len=est_seq_len,
+            forward_only=True
+        )
+        flops_train = calc_flops_per_token(
+            n_layer=n_layer,
+            n_head=n_head,
+            n_kv_head=n_kv_head_for_calc,
+            n_embd=n_embd,
+            vocab_size=vocab_size,
+            seq_len=est_seq_len,
+            forward_only=False
+        )
+
+        # Display memory estimates
+        st.markdown(f"**Parameter Memory ({est_dtype}):** {format_bytes(param_memory)}")
+        st.markdown(f"**KV Cache (B={est_batch_size}, T={est_seq_len}):** {format_bytes(kv_cache_memory)}")
+        st.markdown(f"**Activations (training, est.):** {format_bytes(activation_memory)}")
+
+        st.divider()
+
+        # Display compute estimates
+        st.markdown(f"**FLOPs/token (forward):** {format_flops(flops_fwd)}")
+        st.markdown(f"**FLOPs/token (training):** {format_flops(flops_train)}")
+        st.caption("[FLOPs methodology](https://www.adamcasson.com/posts/transformer-flops)")
+
+        # GQA comparison for nanochat
+        if model_type == "nanochat" and n_kv_head_for_calc < n_head:
+            # Calculate what KV cache would be without GQA
+            kv_cache_mha = calc_memory_kv_cache(
+                n_layer=n_layer,
+                n_kv_head=n_head,  # Full MHA
+                head_dim=params["head_dim"],
+                batch_size=est_batch_size,
+                seq_len=est_seq_len,
+                dtype=est_dtype
+            )
+            savings = (kv_cache_mha - kv_cache_memory) / kv_cache_mha * 100
+            st.divider()
+            st.markdown("**GQA Savings:**")
+            st.markdown(f"- KV cache with MHA: {format_bytes(kv_cache_mha)}")
+            st.markdown(f"- KV cache with GQA: {format_bytes(kv_cache_memory)}")
+            st.markdown(f"- **Reduction: {savings:.0f}%**")
+
+        # KV Cache value for generation
+        st.divider()
+        st.markdown(f"**KV Cache Value (generating {est_gen_tokens} tokens):**")
+
+        # Calculate FLOPs with and without KV cache
+        prompt_len = 100  # Assume 100 token prompt
+        flops_with_cache = calc_generation_flops(
+            n_layer=n_layer,
+            n_head=n_head,
+            n_kv_head=n_kv_head_for_calc,
+            n_embd=n_embd,
+            vocab_size=vocab_size,
+            prompt_len=prompt_len,
+            gen_tokens=est_gen_tokens,
+            use_kv_cache=True
+        )
+        flops_without_cache = calc_generation_flops(
+            n_layer=n_layer,
+            n_head=n_head,
+            n_kv_head=n_kv_head_for_calc,
+            n_embd=n_embd,
+            vocab_size=vocab_size,
+            prompt_len=prompt_len,
+            gen_tokens=est_gen_tokens,
+            use_kv_cache=False
+        )
+        speedup = flops_without_cache / flops_with_cache
+
+        st.markdown(f"- With KV cache: {format_flops(flops_with_cache)}")
+        st.markdown(f"- Without KV cache: {format_flops(flops_without_cache)}")
+        st.markdown(f"- **Speedup: {speedup:.1f}×**")
+        st.caption(f"Without KV cache, must run entire forward pass (including MLP!) on all previous tokens at each step. Speedup ≈ N/2 = {est_gen_tokens//2}×")
 
         st.divider()
 
