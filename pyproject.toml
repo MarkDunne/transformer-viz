@@ -1,0 +1,9 @@
+[project]
+name = "model-viz"
+version = "0.1.0"
+description = "Interactive Transformer Architecture Visualizer"
+requires-python = ">=3.12"
+dependencies = [
+    "graphviz>=0.21",
+    "streamlit>=1.52.2",
+]
