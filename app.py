@@ -1114,7 +1114,7 @@ def create_nanochat_diagram(params: dict, config: dict) -> graphviz.Digraph:
 
 def main():
     st.title("Transformer Architecture Visualizer")
-    st.markdown("Interactive exploration of nanoGPT and nanochat model architectures")
+    st.markdown("Interactive exploration of nanoGPT and nanochat model architectures · [GitHub](https://github.com/MarkDunne/transformer-viz)")
 
     # Sidebar for configuration
     with st.sidebar:
@@ -1123,8 +1123,8 @@ def main():
         # Model type selector
         model_type = st.radio(
             "Architecture",
-            ["nanoGPT", "nanochat"],
-            help="nanoGPT: Classic GPT-2 style. nanochat: Modern with GQA, RoPE, etc."
+            ["nanochat", "nanoGPT"],
+            help="nanochat: Modern with GQA, RoPE, etc. nanoGPT: Classic GPT-2 style."
         )
 
         # GitHub links
