@@ -5,9 +5,10 @@ A Streamlit dashboard for exploring nanoGPT and nanochat model architectures.
 Displays model components, parameter counts, and architecture diagrams.
 
 Sources:
-- FLOPs calculation: https://www.adamcasson.com/posts/transformer-flops
+- FLOPs calculation: https://github.com/karpathy/nanochat/discussions/420#discussion-9319591
 - PaLM paper (Appendix B): https://arxiv.org/abs/2204.02311
 - nanoGPT: https://github.com/karpathy/nanoGPT
+- nanochat: https://github.com/karpathy/nanochat
 """
 
 import sys
@@ -369,7 +370,9 @@ self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
 # Same size as K projection (GQA shares KV head count)
 # Input: (B, T, d), Output: (B, T, k×d_h) -> reshaped to (B, T, k, d_h)""",
 
-    "rotary": """# Rotary Position Embeddings (gpt.py:53-59, 86-88)
+    "rotary": """# Rotary Position Embeddings + QK Normalization (gpt.py:53-59, 86-88)
+
+# RoPE: Applied to Q and K only (not V)
 def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
@@ -377,12 +380,15 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
-# cos, sin are precomputed: shape (1, T, 1, d_h/2)
-# Applied to Q and K: rotates pairs of dimensions
-# No learnable parameters - position encoded via rotation angles
+# QK-Norm: Applied to Q and K only (not V)
+q, k = norm(q), norm(k)  # RMSNorm before attention
 
-# QK normalization (gpt.py:88)
-q, k = norm(q), norm(k)  # RMSNorm before attention""",
+# Why Q and K only, not V?
+# - Attention scores = Q @ K^T (V not involved)
+# - RoPE: rotating Q and K encodes RELATIVE position (i-j) in their dot product
+# - QK-Norm: bounds Q and K magnitudes to prevent attention logit explosion
+# - V carries content that flows through - no position or stability concerns
+# No learnable parameters""",
 
     "flash_attn": """# Flash Attention 3 (gpt.py:93-95)
 y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
@@ -533,7 +539,7 @@ def calc_nanogpt_params(n_layer: int, n_head: int, n_embd: int,
 
 
 def calc_nanochat_params(n_layer: int, n_head: int, n_kv_head: int, n_embd: int,
-                         vocab_size: int, sequence_len: int) -> dict:
+                         vocab_size: int) -> dict:
     """
     Calculate nanochat parameter counts.
 
@@ -734,19 +740,22 @@ def calc_flops_per_token(
     """
     Estimate FLOPs per token.
 
-    Based on "Transformer FLOPs" by Adam Casson and the PaLM paper:
-    https://www.adamcasson.com/posts/transformer-flops
+    Based on nanochat's estimate_flops() and the PaLM paper (Appendix B):
+    https://github.com/karpathy/nanochat/discussions/420#discussion-9319591
+    https://arxiv.org/abs/2204.02311
 
-    Key formulas:
-    - Each matmul with weight (in, out) costs 2 × in × out FLOPs (multiply + accumulate)
-    - Forward pass: ~2N FLOPs per token (N = non-embedding params in matmuls)
-    - Backward pass: ~4N FLOPs per token (grad_input + grad_weight)
-    - Total training: ~6N FLOPs per token
+    Training formula (from nanochat):
+        flops_per_token = 6 * (nparams - embedding_params) + 12 * l * h * q * t
 
-    Attention context-dependent term (per layer per token):
-    - Q @ K^T: 2 × T × d_attn FLOPs
-    - attn @ V: 2 × T × d_attn FLOPs
-    - Total: 4 × T × d_attn (often negligible when d > T/12)
+    Where:
+    - 6× multiplier: 2 FLOPs/param forward (multiply + accumulate) + 4 FLOPs/param backward
+    - 12 * l * h * q * t: attention context term (Q @ K^T and attn @ V matmuls)
+    - l = n_layer, h = n_head, q = head_dim, t = seq_len
+    - Note: h * q = n_embd, so attention term = 12 * n_layer * n_embd * seq_len
+
+    Forward-only uses 2× and 4× instead of 6× and 12×.
+
+    We exclude embedding params (just a lookup, not a matmul) following nanochat/Chinchilla.
     """
     head_dim = n_embd // n_head
 
@@ -1163,14 +1172,26 @@ def main():
         st.subheader("Parameters")
 
         # Common parameters
-        n_layer = st.slider("n_layer (depth)", 1, 64, defaults.get("n_layer", 12),
+        n_layer = st.slider("n_layer (depth)", 1, 128, defaults.get("n_layer", 12),
                            help="Number of transformer blocks")
-        n_head = st.slider("n_head (attention heads)", 1, 32, defaults.get("n_head", 12),
-                          help="Number of attention heads (query heads for GQA)")
+
+        # n_embd first, then constrain n_head to valid divisors
         n_embd = st.select_slider("n_embd (width)",
                                   options=[48, 64, 128, 256, 384, 512, 768, 1024, 1280, 1536, 1600, 2048, 4096],
                                   value=defaults.get("n_embd", 768),
                                   help="Embedding dimension / hidden size")
+
+        # Compute valid n_head values (divisors of n_embd, capped at 128)
+        valid_heads = [h for h in range(1, min(n_embd, 128) + 1) if n_embd % h == 0]
+        default_head = defaults.get("n_head", 12)
+        if default_head not in valid_heads:
+            # Snap to nearest valid divisor
+            default_head = min(valid_heads, key=lambda x: abs(x - default_head))
+        n_head = st.select_slider("n_head (attention heads)",
+                                  options=valid_heads,
+                                  value=default_head,
+                                  help="Number of attention heads (must divide n_embd evenly)")
+
         vocab_size = st.number_input("vocab_size", 1, 200000, defaults.get("vocab_size", 50304),
                                      help="Vocabulary size")
 
@@ -1189,9 +1210,6 @@ def main():
                 "bias": bias,
             }
         else:
-            sequence_len = st.slider("sequence_len (context)", 1, 8192, defaults.get("sequence_len", 1024),
-                                    help="Maximum sequence length / context window")
-
             # GQA configuration
             st.markdown("**Group-Query Attention (GQA)**")
             # n_kv_head must divide n_head evenly
@@ -1212,19 +1230,17 @@ def main():
             else:
                 st.info(f"GQA: {gqa_ratio} query heads share each KV pair")
 
+            # Note: nanochat uses RoPE, so sequence length is not an architectural
+            # constraint (unlike nanoGPT's block_size). It only affects inference
+            # memory/compute, configured in Estimation Settings below.
+
             config = {
                 "n_layer": n_layer,
                 "n_head": n_head,
                 "n_kv_head": n_kv_head,
                 "n_embd": n_embd,
                 "vocab_size": vocab_size,
-                "sequence_len": sequence_len,
             }
-
-        # Validation
-        if n_embd % n_head != 0:
-            st.error(f"n_embd ({n_embd}) must be divisible by n_head ({n_head})")
-            st.stop()
 
         # Shape notation legend with actual values
         st.divider()
@@ -1232,7 +1248,8 @@ def main():
 
         # Compute derived values
         head_dim = n_embd // n_head
-        seq_len = config.get("block_size", config.get("sequence_len", 1024))
+        # For nanoGPT, block_size is architectural; for nanochat, use preset default for estimation
+        seq_len = config.get("block_size", defaults.get("sequence_len", 1024))
         kv_heads = config.get("n_kv_head", n_head)
 
         st.markdown(f"""
@@ -1252,10 +1269,14 @@ def main():
         # Memory/compute estimation settings
         st.divider()
         st.subheader("Estimation Settings")
-        est_batch_size = st.number_input("Batch size (B)", 1, 256, 1, help="Batch size for memory estimates")
-        est_seq_len = st.number_input("Sequence length (T)", 1, 32768, seq_len, help="Sequence length for KV cache and activation estimates")
+        st.caption("Configure scenario for memory & compute estimates")
+        est_batch_size = st.number_input("Concurrent users", 1, 100000, 1, help="Number of parallel requests/users (each needs their own KV cache)")
+        est_prompt_len = st.number_input("Prompt length", 1, 1000000, seq_len, help="Number of tokens in the input prompt")
+        est_gen_tokens = st.number_input("Tokens to generate", 1, 100000, 100, help="Number of new tokens to generate after the prompt")
         est_dtype = st.selectbox("Dtype", ["bf16", "fp16", "fp32", "int8"], help="Data type for memory calculations")
-        est_gen_tokens = st.number_input("Tokens to generate", 1, 8192, 100, help="Number of tokens to generate (for KV cache savings calculation)")
+
+        # Total context = prompt + generated
+        est_total_context = est_prompt_len + est_gen_tokens
 
     # Calculate parameters
     if model_type == "nanoGPT":
@@ -1274,7 +1295,6 @@ def main():
             n_kv_head=config["n_kv_head"],
             n_embd=config["n_embd"],
             vocab_size=config["vocab_size"],
-            sequence_len=config["sequence_len"],
         )
 
     # Main content area - two columns
@@ -1364,7 +1384,7 @@ def main():
             n_kv_head=n_kv_head_for_calc,
             head_dim=params["head_dim"],
             batch_size=est_batch_size,
-            seq_len=est_seq_len,
+            seq_len=est_total_context,  # KV cache holds prompt + generated
             dtype=est_dtype
         )
         activation_memory = calc_memory_activations(
@@ -1372,7 +1392,7 @@ def main():
             n_head=n_head,
             n_embd=n_embd,
             batch_size=est_batch_size,
-            seq_len=est_seq_len,
+            seq_len=est_total_context,
             dtype=est_dtype,
             flash_attention=True
         )
@@ -1382,7 +1402,7 @@ def main():
             n_kv_head=n_kv_head_for_calc,
             n_embd=n_embd,
             vocab_size=vocab_size,
-            seq_len=est_seq_len,
+            seq_len=est_total_context,
             forward_only=True
         )
         flops_train = calc_flops_per_token(
@@ -1391,21 +1411,30 @@ def main():
             n_kv_head=n_kv_head_for_calc,
             n_embd=n_embd,
             vocab_size=vocab_size,
-            seq_len=est_seq_len,
+            seq_len=est_total_context,
             forward_only=False
         )
 
         # Display memory estimates
         st.markdown(f"**Parameter Memory ({est_dtype}):** {format_bytes(param_memory)}")
-        st.markdown(f"**KV Cache (B={est_batch_size}, T={est_seq_len}):** {format_bytes(kv_cache_memory)}")
+        st.caption(f"`N × bytes = {format_params(params['total'])} × {DTYPE_BYTES[est_dtype]}`")
+
+        st.markdown(f"**KV Cache ({est_batch_size} users × {est_total_context:,} ctx):** {format_bytes(kv_cache_memory)}")
+        st.caption(f"`2 × L × T × k × d_h × bytes = 2 × {n_layer} × {est_total_context:,} × {n_kv_head_for_calc} × {params['head_dim']} × {DTYPE_BYTES[est_dtype]}`")
+
         st.markdown(f"**Activations (training, est.):** {format_bytes(activation_memory)}")
+        st.caption("Rough estimate: residuals + QKV + MLP intermediate + 20% overhead")
 
         st.divider()
 
         # Display compute estimates
         st.markdown(f"**FLOPs/token (forward):** {format_flops(flops_fwd)}")
+        st.caption(f"`2N + 4×L×d×T = 2×{format_params(params['total'])} + 4×{n_layer}×{n_embd}×{est_total_context:,}`")
+
         st.markdown(f"**FLOPs/token (training):** {format_flops(flops_train)}")
-        st.caption("[FLOPs methodology](https://www.adamcasson.com/posts/transformer-flops)")
+        st.caption(f"`6N + 12×L×d×T` (forward + backward)")
+
+        st.caption("[FLOPs methodology](https://github.com/karpathy/nanochat/discussions/420#discussion-9319591)")
 
         # GQA comparison for nanochat
         if model_type == "nanochat" and n_kv_head_for_calc < n_head:
@@ -1415,7 +1444,7 @@ def main():
                 n_kv_head=n_head,  # Full MHA
                 head_dim=params["head_dim"],
                 batch_size=est_batch_size,
-                seq_len=est_seq_len,
+                seq_len=est_total_context,
                 dtype=est_dtype
             )
             savings = (kv_cache_mha - kv_cache_memory) / kv_cache_mha * 100
@@ -1427,10 +1456,10 @@ def main():
 
         # KV Cache value for generation
         st.divider()
-        st.markdown(f"**KV Cache Value (generating {est_gen_tokens} tokens):**")
+        st.markdown(f"**Generation Cost ({est_prompt_len:,} prompt → {est_gen_tokens:,} tokens):**")
 
         # Calculate FLOPs with and without KV cache
-        prompt_len = 100  # Assume 100 token prompt
+        prompt_len = est_prompt_len
         flops_with_cache = calc_generation_flops(
             n_layer=n_layer,
             n_head=n_head,
@@ -1456,7 +1485,8 @@ def main():
         st.markdown(f"- With KV cache: {format_flops(flops_with_cache)}")
         st.markdown(f"- Without KV cache: {format_flops(flops_without_cache)}")
         st.markdown(f"- **Speedup: {speedup:.1f}×**")
-        st.caption(f"Without KV cache, must run entire forward pass (including MLP!) on all previous tokens at each step. Speedup ≈ N/2 = {est_gen_tokens//2}×")
+        st.caption(f"With cache: `2N×G + 4Ld×(PG + G²/2)` — only new token through linear layers")
+        st.caption(f"Without: `2N×Σt + 4Ld×Σt²` — all tokens recomputed each step")
 
         st.divider()
 
